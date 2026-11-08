@@ -10,7 +10,7 @@
   "engines": {
     "node": ">=18"
   },
-  "optionalDependencies": {
-    "@tencent-ai/workbuddy-cloud-sdk": "*"
+  "dependencies": {
+    "@tencent-ai/workbuddy-cloud-sdk": "dev"
   }
 }

@@ -10,6 +10,17 @@ const UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML,
 // 🔴 抱豹指令：换主题任务跳过不做（Hp_Appearance 有真实副作用）
 const SKIP_TASKS = new Set(['Hp_Appearance']);
 
+// 已有自动配方覆盖的 task_code（与 runGrowthTasks 里的 recipes 保持一致）。
+// 用于 /tasks 端点判断"这条能不能自动做"：不在表里的 = 必须真人操作。
+const RECIPE_CODES = new Set([
+  'Library_read', 'Expert_lighthouse', 'Buddy_App',
+  'create_canvas', 'automation_1', 'playbook_prompt',
+  'skill_1', 'RichMeow_Chat', 'expert_5', 'Expert_team_use_3',
+  'template_5', 'chat_5', 'Model_chat_GLM5.2',
+  'expert_use_maidehao', 'expert_use_douyinyin',
+  'expert_use_shangjia_xuanchuan', 'expert_use_bowangwang',
+]);
+
 function deriveId(uid, salt) {
   return crypto.createHash('md5').update(salt + ':' + uid).digest('hex').slice(0, 36);
 }
@@ -271,6 +282,28 @@ async function tExpert5(token, log) {
   return taskProgress(token, 'expert_5');
 }
 
+// 指定专家任务（expert_use_xxx）：必须召唤"那一个"专家，服务端按 expertId 记账。
+// 早期 tExpert5 是随便抓一个专家，对这类任务是无效的，所以单独写一条。
+async function tSummonExpert(token, log, expertId, expertName) {
+  const name = expertName || '专家';
+  await report(token, [
+    { eventCode: 'expert_summoned', id: expertId, name: name, type: 'agent', expertTitle: name,
+      expertType: 'agent', source: 'builtin' },
+    { eventCode: 'expert_actual_use', id: expertId, name: name, type: '', expertType: 'agent', source: 'builtin',
+      version: '', cost: 0, characterCount: 12, conversationId: 'conv-' + uuid(), requestId: uuid(),
+      messageId: 'msg-' + uuid(), requestModelId: 'deepseek-v4-flash', requestModelName: 'DeepSeek V4 Flash' },
+  ]);
+  await sleep(3500);
+}
+
+// 任务里自带的 deeplink 已经写明 expertId，直接照抄，不猜
+const SPECIFIC_EXPERTS = {
+  expert_use_maidehao: { id: 'ex_GDl31WahyIH0', name: '中国电商运营专家' },
+  expert_use_douyinyin: { id: 'ex_FbY5nlWTqDod', name: '抖音策略师' },
+  expert_use_shangjia_xuanchuan: { id: 'ex_Weo3x2EZuSDm', name: '商家宣传页与海报设计师' },
+  expert_use_bowangwang: { id: 'ex_WZY136wV5aMt', name: '直播电商教练' },
+};
+
 async function tExpertTeam3(token, log) {
   const uid = uidOf(token), nick = nickOf(token);
   let teams = [];
@@ -479,6 +512,10 @@ async function runGrowthTasks(token, log, dbEvent, opts = {}) {
     { codes: ['skill_1'], fn: () => tSkill1(token, log) },
     { codes: ['RichMeow_Chat'], fn: () => tRichMeow(token, log) },
     { codes: ['expert_5'], fn: () => tExpert5(token, log) },
+    // 指定专家任务：每个任务绑定一个 expertId，各 50 分
+    ...Object.entries(SPECIFIC_EXPERTS).map(([code, v]) => ({
+      codes: [code], fn: () => tSummonExpert(token, log, v.id, v.name),
+    })),
     { codes: ['Expert_team_use_3'], fn: () => tExpertTeam3(token, log) },
     { codes: ['template_5'], fn: () => tTemplate5(token, log) },
     { codes: ['chat_5'], fn: () => tChatN(token, 'chat_5', 5, ['你好', '今天天气怎么样？', '1+1等于几？', 'Python是什么？', '推荐一本好书']) },
@@ -493,6 +530,24 @@ async function runGrowthTasks(token, log, dbEvent, opts = {}) {
 
   // 2) 先取一次全量：有活干才继续（无缺口 → 极轻量返回，省调用）
   const tasks = await allTasks(token);
+
+  // 2.1) 已完成但还没领奖的，直接补领。
+  // 之前这些任务会被 actionable 过滤掉（accept_status='completed' 被排除），
+  // 结果"做完了却没拿到分"，必须单独补一刀。
+  for (const t of tasks) {
+    if (t.accept_status !== 'completed' || SKIP_TASKS.has(t.task_code)) continue;
+    try {
+      const c = await claim(token, t.task_code);
+      const cd = (c.json && c.json.data) || {};
+      if (c.json && c.json.code === 0) {
+        log('  🎁 ' + t.task_code + ' 补领奖: +' + (cd.credit || '?') + '积分 +' + (cd.energy || '?') + '能量');
+        if (dbEvent) dbEvent('growth-claim', t.task_code + ' 领奖 +' + (cd.credit || '?') + '积分', cd);
+        out.push(t.task_code + ':补领成功');
+      } else {
+        out.push(t.task_code + ':补领失败(' + (c.json && c.json.code) + ')');
+      }
+    } catch (e) { out.push(t.task_code + ':补领异常'); }
+  }
   const actionable = tasks.filter(t => !SKIP_TASKS.has(t.task_code)
     && t.accept_status !== 'completed' && t.accept_status !== 'claimed'
     && t.accept_status !== 'not_accepted');
@@ -534,4 +589,4 @@ async function runGrowthTasks(token, log, dbEvent, opts = {}) {
   return { results: out, didWork: true, tasks };
 }
 
-module.exports = { runGrowthTasks, allTasks, taskProgress, SKIP_TASKS, tExpertTeam3, getTeams };
+module.exports = { runGrowthTasks, allTasks, taskProgress, SKIP_TASKS, RECIPE_CODES, tExpertTeam3, getTeams, tSummonExpert, SPECIFIC_EXPERTS };

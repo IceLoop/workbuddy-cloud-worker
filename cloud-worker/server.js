@@ -75,15 +75,28 @@ function daysLeft(ms) { return ms ? Math.round((ms - Date.now()) / 8640000) / 10
 // publicConfig 两项（endpoint / publishableKey）均为可公开值；密钥与令牌永不落库。
 // 故障隔离：落库失败只记日志，绝不阻断签到/旅行主流程。
 let CLOUD_DB = null;
+let CLOUD_DB_ERR = '未初始化';
+// 签到活动的官方数据（累计获得 / 连续天数 / 本周进度），缓存 5 分钟，
+// 因为控制台每 30 秒轮询一次，没必要每次都打官方接口
+let CREDIT_CACHE = { at: 0, data: null };
+// 成长任务列表缓存（60 秒）：控制台 30 秒轮询，没必要每次都打官方接口
+let TASKS_CACHE = { at: 0, data: null };
 function initCloudDb() {
   try {
     const c = (CFG && CFG.cloud) || {};
     const endpoint = c.endpoint || process.env.CLOUD_ENDPOINT || '';
     const publishableKey = c.publishableKey || process.env.CLOUD_PUBLISHABLE_KEY || '';
-    if (!endpoint || !publishableKey) return;
+    if (!endpoint || !publishableKey) {
+      CLOUD_DB_ERR = '缺少 cloud.endpoint / cloud.publishableKey';
+      return;
+    }
     const { createWorkBuddyCloud } = require('@tencent-ai/workbuddy-cloud-sdk');
     CLOUD_DB = createWorkBuddyCloud({ endpoint, publishableKey });
-  } catch (e) { CLOUD_DB = null; }
+    CLOUD_DB_ERR = '';
+  } catch (e) {
+    CLOUD_DB = null;
+    CLOUD_DB_ERR = 'SDK 初始化失败: ' + String((e && e.message) || e).slice(0, 160);
+  }
 }
 
 async function dbEvent(account, kind, detail, extra) {
@@ -91,9 +104,16 @@ async function dbEvent(account, kind, detail, extra) {
   try {
     const r = await CLOUD_DB.database.from('wbmon_events')
       .insert({ account, kind, detail, extra: extra || null }).select();
-    if (r.error) log('云数据库写入失败: ' + JSON.stringify(r.error).slice(0, 120));
+    if (r.error) {
+      const code = (r.error && r.error.code) || '';
+      const msg = String((r.error && r.error.message) || r.error).slice(0, 160);
+      // 落库失败不阻断主流程，但必须留痕，别让它静默消失
+      log(`⚠️ 云数据库写入失败${code ? '[' + code + ']' : ''}: ${msg}`);
+      if (code === '42P01') log('   表 wbmon_events 不存在，请先在云数据库建表');
+      if (code === '42501') log('   权限被拒：检查 GRANT 与 RLS 策略两道门');
+    }
   } catch (e) {
-    log('云数据库异常: ' + (e && e.message || e));
+    log('云数据库异常: ' + String((e && e.message) || e).slice(0, 160));
   }
 }
 
@@ -303,7 +323,7 @@ async function tick() {
 // 策略：每轮都做一次「轻量检查」（全量任务一次请求）；无缺口则几乎零成本。
 // 有缺口时跑配方，但**同一任务当天最多尝试 3 次**（防卡死任务空转）。
 // 好处：官方"不定期上线"的新任务最多 20 分钟就被抓到，不必等到次日。
-const { runGrowthTasks } = require('./growth-tasks.js');
+const { runGrowthTasks, allTasks, RECIPE_CODES } = require('./growth-tasks.js');
 async function maybeGrowthTasks(st) {
   const today = cnDateStr();
   st.growthRuns = st.growthRuns || {};
@@ -339,9 +359,26 @@ function authed(req, urlObj) {
   return key && CFG.access_key && key === CFG.access_key;
 }
 
+// 可视化控制台：静态页面，数据全部走下面这些 JSON 端点
+let DASHBOARD_HTML = '';
+try { DASHBOARD_HTML = fs.readFileSync(path.join(HERE, 'dashboard.html'), 'utf8'); }
+catch (e) { DASHBOARD_HTML = ''; }
+
 const server = http.createServer((req, res) => {
   const urlObj = new URL(req.url, 'http://localhost');
   const send = (code, obj) => { res.writeHead(code, { 'content-type': 'application/json; charset=utf-8' }); res.end(JSON.stringify(obj, null, 1)); };
+
+  // 首页必须在鉴权之前：浏览器直接打开就是控制台，而不是一段「未授权」JSON
+  if (urlObj.pathname === '/' || urlObj.pathname === '/index.html' || urlObj.pathname === '/dashboard') {
+    if (!DASHBOARD_HTML) {
+      res.writeHead(500, { 'content-type': 'text/plain; charset=utf-8' });
+      return res.end('dashboard.html 缺失，无法渲染控制台');
+    }
+    res.writeHead(200, { 'content-type': 'text/html; charset=utf-8', 'cache-control': 'no-store' });
+    return res.end(DASHBOARD_HTML);
+  }
+  if (urlObj.pathname === '/favicon.ico') { res.writeHead(204); return res.end(); }
+
   if (urlObj.pathname === '/health') {
     // 这个端点**公网无鉴权**，所以只允许放"非敏感、能自证"的信息：
     // 不带任何账号昵称/余额/任务明细，只给数量、告警种类和业务锚点。
@@ -367,6 +404,7 @@ const server = http.createServer((req, res) => {
       lastOkAt: st.lastOkAt || null,
       tickMinutes: TICK_MINUTES,
       acctCount: CFG.accounts.length,
+      db: CLOUD_DB ? 'on' : 'off',
       tokenDaysMin: tokenDays.length ? Math.min(...tokenDays) : null,
       alerts: Array.from(kinds),
       alertCount: kinds.size,
@@ -411,11 +449,165 @@ const server = http.createServer((req, res) => {
   if (urlObj.pathname === '/log') {
     return send(200, { ok: true, log: LOG_RING.slice(-100) });
   }
+  if (urlObj.pathname === '/tasks') {
+    // 成长任务面板：全量任务 + 自动判定的状态分类
+    // 状态：done=已领取 / claimable=已完成待领取 / running=有配方自动进行中 / manual=需人工 / failed=今日试满仍失败
+    (async () => {
+      const a0 = CFG.accounts[0];
+      if (!a0) return { ok: false, err: '无账号' };
+      if (!TASKS_CACHE.data || Date.now() - TASKS_CACHE.at > 60000) {
+        try {
+          const list = await allTasks(a0.accessToken);
+          TASKS_CACHE = { at: Date.now(), data: list };
+        } catch (e) {
+          if (!TASKS_CACHE.data) return { ok: false, err: '拉取任务失败: ' + String((e && e.message) || e).slice(0, 120) };
+        }
+      }
+      const raw = TASKS_CACHE.data || [];
+      const st = loadState();
+      const tries = (((st.growthRuns || {})[a0.name] || {}).tries) || {};
+      const MAX_TRIES = 3;
+      const rows = raw.map(t => {
+        const covered = RECIPE_CODES.has(t.task_code);
+        const done = (tries[t.task_code] || 0) >= MAX_TRIES;
+        let state;
+        if (t.accept_status === 'claimed') state = 'done';
+        else if (t.accept_status === 'completed') state = 'claimable';
+        else if (!covered) state = 'manual';
+        else if (done) state = 'failed';
+        else state = 'running';
+        const p = t.progress || {};
+        return {
+          code: t.task_code, title: t.title || t.task_code, desc: t.task_desc || '',
+          state, covered, cur: p.current ?? 0, tgt: p.target ?? 1,
+          credit: Number(t.reward_credit) || 0, energy: Number(t.reward_energy) || 0,
+          tries: tries[t.task_code] || 0, acceptStatus: t.accept_status, endAt: t.valid_end || null,
+        };
+      });
+      const sum = { total: rows.length, done: 0, claimable: 0, running: 0, manual: 0, failed: 0 };
+      let creditDone = 0, creditLeft = 0;
+      for (const r of rows) {
+        sum[r.state] = (sum[r.state] || 0) + 1;
+        if (r.state === 'done') creditDone += r.credit; else creditLeft += r.credit;
+      }
+      return { ok: true, sum, creditDone, creditLeft, fetchedAt: new Date().toISOString(), tasks: rows };
+    })().then(r => send(r.ok ? 200 : 500, r)).catch(e => send(500, { ok: false, err: String(e) }));
+    return;
+  }
+  if (urlObj.pathname === '/stats') {
+    // 每日积分聚合：从云数据库的事件流里按东八区自然日汇总
+    // 积分来源三处：签到(extra.credit) / 成长任务领奖(extra.credit) / 旅行领奖(extra.credit_granted)
+    const spanDays = Math.min(Math.max(Number(urlObj.searchParams.get('days') || 14), 1), 60);
+    (async () => {
+      // 账号维度取自本地配置，只回传展示用字段，绝不下发令牌
+      const accounts = CFG.accounts.map(a => ({
+        name: a.name,
+        uidShort: a.uid ? String(a.uid).slice(0, 8) : '',
+        accessDaysLeft: daysLeft(a.expiresAt),
+        refreshDaysLeft: daysLeft(a.refreshExpiresAt),
+      }));
+      if (!CLOUD_DB) {
+        return { ok: true, source: 'cloud-db-unavailable', reason: CLOUD_DB_ERR, accounts, days: [], total: 0, todayCredit: 0 };
+      }
+      const since = new Date(Date.now() - (spanDays - 1) * 86400000);
+      const r = await CLOUD_DB.database.from('wbmon_events')
+        .select('id, account, kind, detail, extra, created_at')
+        .gte('created_at', since.toISOString())
+        .order('id', { ascending: false })
+        .limit(800);
+      if (r.error) {
+        return { ok: false, err: String((r.error && r.error.message) || r.error).slice(0, 200), accounts, days: [], total: 0, todayCredit: 0 };
+      }
+      const creditOf = (e) => {
+        const x = (e.extra && typeof e.extra === 'object') ? e.extra : {};
+        for (const n of [x.credit, x.credits, x.credit_granted, x.amount]) {
+          const v = Number(n);
+          if (Number.isFinite(v) && v > 0) return v;
+        }
+        const m = String(e.detail || '').match(/\+(\d+)\s*积分/);
+        return m ? Number(m[1]) : 0;
+      };
+      const cnDay = (iso) => new Date(new Date(iso).getTime() + 8 * 3600 * 1000).toISOString().slice(0, 10);
+      const acc = new Map();
+      for (const e of (r.data || [])) {
+        const d = cnDay(e.created_at);
+        const cur = acc.get(d) || { date: d, credit: 0, events: 0, checkin: 0, growth: 0, travel: 0 };
+        const c = creditOf(e);
+        const k = String(e.kind || '');
+        cur.credit += c;
+        cur.events += 1;
+        if (k.indexOf('checkin') >= 0) cur.checkin += c;
+        else if (k.indexOf('growth') >= 0) cur.growth += c;
+        else if (k.indexOf('travel') >= 0) cur.travel += c;
+        acc.set(d, cur);
+      }
+      const days = [];
+      for (let i = spanDays - 1; i >= 0; i--) {
+        const d = new Date(Date.now() + 8 * 3600 * 1000 - i * 86400000).toISOString().slice(0, 10);
+        days.push(acc.get(d) || { date: d, credit: 0, events: 0, checkin: 0, growth: 0, travel: 0 });
+      }
+      // 对账：签到事件可能在云库接入之前就已发生（历史遗留），这时库里没有那条记录，
+      // 用本地 state 里的当日签到积分补上。只有当天的 state 可信，且已有签到记录时不重复补。
+      const stForStats = loadState();
+      const todayStr = new Date(Date.now() + 8 * 3600 * 1000).toISOString().slice(0, 10);
+      const todayRec = days[days.length - 1];
+      if (todayRec && !todayRec.checkin) {
+        for (const a of CFG.accounts) {
+          const c = (((stForStats.accounts || {})[a.name] || {}).checkin) || {};
+          const cr = Number(c.credit) || 0;
+          if (c.day === todayStr && c.done && cr > 0) {
+            todayRec.checkin += cr;
+            todayRec.credit += cr;
+          }
+        }
+      }
+      const total = days.reduce((s, x) => s + x.credit, 0);
+      const today = days[days.length - 1] || { credit: 0 };
+
+      // 官方签到活动数据：累计获得、连续天数、本周进度、活动周期
+      let wallet = null;
+      try {
+        if (!CREDIT_CACHE.data || Date.now() - CREDIT_CACHE.at > 300000) {
+          const a0 = CFG.accounts[0];
+          const r0 = await reqJson(HOST_CB, '/v2/billing/meter/checkin-activity-status', a0.accessToken, 'POST', {});
+          if (r0.status === 200 && r0.json && r0.json.code === 0 && r0.json.data) {
+            CREDIT_CACHE = { at: Date.now(), data: r0.json.data };
+          }
+        }
+        const w = CREDIT_CACHE.data;
+        if (w) {
+          let remainDays = null, maxRemain = 0;
+          if (w.end_time) {
+            const end = new Date(String(w.end_time).replace(' ', 'T') + '+08:00').getTime();
+            const todayStart = new Date(cnDateStr() + 'T00:00:00+08:00').getTime();
+            remainDays = Math.max(0, Math.ceil((end - todayStart) / 86400000));
+            maxRemain = remainDays * (Number(w.daily_credit) || 0);
+          }
+          wallet = {
+            active: !!w.active,
+            themeName: w.theme_name || '',
+            totalCredits: Number(w.total_credits) || 0,
+            dailyCredit: Number(w.daily_credit) || 0,
+            streakDays: Number(w.streak_days) || 0,
+            todayCheckedIn: !!w.today_checked_in,
+            weekProgress: Array.isArray(w.week_progress) ? w.week_progress : [],
+            weekDays: Number(w.week_checkin_days) || 0,
+            remainDays,
+            maxRemain,
+            endTime: w.end_time || null,
+          };
+        }
+      } catch (e) { wallet = null; }
+
+      return { ok: true, source: 'cloud-db', accounts, days, total, todayCredit: today.credit, todayBreakdown: today, wallet };
+    })().then(res2 => send(res2.ok ? 200 : 500, res2)).catch(e => send(500, { ok: false, err: String(e) }));
+    return;
+  }
   if (urlObj.pathname === '/history') {
     // 云数据库中的运行历史（签到/领奖/派出事件），insert-only 审计表
     const limit = Math.min(Math.max(Number(urlObj.searchParams.get('limit') || 50), 1), 200);
     (async () => {
-      if (!CLOUD_DB) return { ok: true, source: 'cloud-db-unavailable', events: [] };
+      if (!CLOUD_DB) return { ok: true, source: 'cloud-db-unavailable', reason: CLOUD_DB_ERR, events: [] };
       const r = await CLOUD_DB.database.from('wbmon_events')
         .select('id, account, kind, detail, created_at')
         .neq('kind', 'selftest')
@@ -464,7 +656,7 @@ loadCfg();
 initCloudDb();
 server.listen(PORT, '0.0.0.0', () => {
   log('wbmon-cloud 已启动，端口 ' + PORT + '，账号 ' + CFG.accounts.length + ' 个');
-  log('云数据库（BaaS）：' + (CLOUD_DB ? '已接入，运行历史将落库' : '初始化失败，仅本地日志'));
+  log('云数据库（BaaS）：' + (CLOUD_DB ? '已接入，运行历史将落库' : '未接入（' + CLOUD_DB_ERR + '），仅本地日志'));
   tick().catch(e => log('首次tick异常: ' + e.message));
   schedule();
 });
