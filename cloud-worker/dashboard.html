@@ -192,9 +192,10 @@
     </div>
   </div>
 
-  <div class="note">
-    <i>说明</i>
-    <span>「积分余额」与「每日消耗」：官方未对外提供查询接口（客户端仅调用签到与埋点接口，balance / usage 均不存在），故不做估算展示。下方为可核实的真实进账数据。</span>
+  <div class="panel tasks-panel">
+    <h2>成长任务 <span class="n" id="taskSum"></span></h2>
+    <div class="tsum" id="tsChips"></div>
+    <div class="tlist" id="tlist"><div class="empty">加载中…</div></div>
   </div>
 
   <div class="grid">
@@ -211,12 +212,6 @@
     <div class="chart" id="chart"><div class="empty">加载中…</div></div>
   </div>
 
-  <div class="panel tasks-panel">
-    <h2>成长任务 <span class="n" id="taskSum"></span></h2>
-    <div class="tsum" id="tsChips"></div>
-    <div class="tlist" id="tlist"><div class="empty">加载中…</div></div>
-  </div>
-
   <div class="cols">
     <div class="panel">
       <h2>运行历史 <span class="n" id="histN"></span></h2>
@@ -226,6 +221,11 @@
       <h2>最近日志</h2>
       <div class="body" id="logBody"><div class="empty">加载中…</div></div>
     </div>
+  </div>
+
+  <div class="note">
+    <i>说明</i>
+    <span>「积分余额」与「每日消耗」：官方未对外提供查询接口（客户端仅调用签到与埋点接口，balance / usage 均不存在），故不做估算展示。其余数据均来自官方接口与云数据库真实记录。</span>
   </div>
 
   <div class="foot">数据来源：<code>/status</code> <code>/log</code> <code>/history</code> · 每 30 秒自动刷新</div>
