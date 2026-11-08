@@ -563,6 +563,7 @@ const server = http.createServer((req, res) => {
       }
       const total = days.reduce((s, x) => s + x.credit, 0);
       const today = days[days.length - 1] || { credit: 0 };
+      const yesterday = days[days.length - 2] || { credit: 0 };
 
       // 官方签到活动数据：累计获得、连续天数、本周进度、活动周期
       let wallet = null;
@@ -599,7 +600,7 @@ const server = http.createServer((req, res) => {
         }
       } catch (e) { wallet = null; }
 
-      return { ok: true, source: 'cloud-db', accounts, days, total, todayCredit: today.credit, todayBreakdown: today, wallet };
+      return { ok: true, source: 'cloud-db', accounts, days, total, todayCredit: today.credit, todayBreakdown: today, yesterdayCredit: yesterday.credit, wallet };
     })().then(res2 => send(res2.ok ? 200 : 500, res2)).catch(e => send(500, { ok: false, err: String(e) }));
     return;
   }

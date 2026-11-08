@@ -130,6 +130,7 @@
   .w-kv{display:flex;justify-content:space-between;align-items:baseline;font-size:12.5px;padding:3.5px 0;color:var(--mut)}
   .w-kv b{color:var(--tx);font-weight:600;font-variant-numeric:tabular-nums}
   .w-kv b.hl{color:#5fd68e}
+  .w-kv b.na{color:#5d6675;font-weight:400;border-bottom:1px dashed #3a4250;cursor:help}
   .note{font-size:11.5px;color:#5b6371;padding:0 2px 12px;display:flex;gap:6px;align-items:flex-start;line-height:1.7}
   .note i{font-style:normal;color:#7a6a3a;background:rgba(240,165,58,.12);border:1px solid rgba(240,165,58,.25);
     border-radius:5px;padding:0 6px;font-size:11px;white-space:nowrap;margin-top:1px}
@@ -186,9 +187,9 @@
     </div>
     <div class="w-side">
       <div class="w-kv"><span>今日进账</span><b id="wToday">—</b></div>
-      <div class="w-kv"><span>连续签到</span><b id="wStreak">—</b></div>
-      <div class="w-kv"><span>活动剩余</span><b id="wRemain">—</b></div>
+      <div class="w-kv"><span>昨日进账</span><b id="wYest">—</b></div>
       <div class="w-kv"><span>最多还能领</span><b id="wMax" class="hl">—</b></div>
+      <div class="w-kv"><span>余额 / 消耗</span><b class="na" title="官方未提供查询接口：客户端只调用签到与埋点接口，balance / usage 均不存在">不可得</b></div>
     </div>
   </div>
 
@@ -327,17 +328,17 @@
     }
   }
 
-  function renderWallet(w){
+  function renderWallet(w, s){
     if(!w) return;
     setText('wTotal', Number(w.totalCredits||0).toLocaleString('zh-CN'));
     var sub=[];
     if(w.themeName) sub.push(w.themeName);
     if(w.todayCheckedIn) sub.push('今日已签');
+    if(w.streakDays) sub.push('连续 '+w.streakDays+' 天');
     if(w.endTime) sub.push('至 '+String(w.endTime).slice(0,10));
     setText('wSub', sub.join(' · ') || '—');
-    setText('wToday', '+'+Number(w.dailyCredit||0));
-    setText('wStreak', Number(w.streakDays||0)+' 天');
-    setText('wRemain', w.remainDays==null ? '—' : (w.remainDays+' 天'));
+    setText('wToday', '+'+(Number(s && s.todayCredit) || 0));
+    setText('wYest', '+'+(Number(s && s.yesterdayCredit) || 0));
     setText('wMax', w.maxRemain ? ('+'+w.maxRemain) : '—');
 
     var wk=document.getElementById('wWeek');
@@ -401,7 +402,7 @@
       tv.textContent='—'; tv.className='v';
       setText('kTodayCreditS', '云库未接入'+(s.reason?('：'+s.reason):''));
     }else{
-      renderWallet(s.wallet);
+      renderWallet(s.wallet, s);
       tv.textContent='+'+(s.todayCredit||0);
       tv.className='v accent';
       var b=s.todayBreakdown||{};
